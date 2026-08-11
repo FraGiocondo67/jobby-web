@@ -1,65 +1,53 @@
 import { NextRequest } from 'next/server'
-import { authHandler, getAdmin, parseBody, ok, apiError } from '@/lib/api'
+import { authHandler, backendFetch, parseBody, ok, apiError } from '@/lib/api'
 
-// GET /api/notifications — lista notifiche utente
+// BLOCCO 7b (jobby-web -> client puro): notifiche (lettura, marcatura come
+// lette, cancellazione) ora passano dal backend condiviso invece di leggere/
+// scrivere `public.notifications` direttamente via Supabase — chiude anche
+// un gap reale: il backend tiene allineate sia `is_read` che `read_at`,
+// prima jobby-web scriveva solo `read_at` lasciando `is_read` disallineato.
+
+// GET /api/notifications — remap items/unread (backend) -> notifications/unread_count (contratto storico di questa route).
 export const GET = authHandler(async (req, auth) => {
   const { searchParams } = new URL(req.url)
   const limit = Math.min(parseInt(searchParams.get('limit') ?? '30'), 100)
   const unreadOnly = searchParams.get('unread') === 'true'
 
-  const admin = getAdmin()
-  let query = admin.from('notifications')
-    .select('id, type, title, body, data, read_at, created_at')
-    .eq('user_id', auth.userId)
-    .order('created_at', { ascending: false })
-    .limit(limit)
-
-  if (unreadOnly) query = query.is('read_at', null)
-
-  const { data, error } = await query
-  if (error) throw apiError('Errore caricamento notifiche', 500, error.message)
-
-  const { count: unreadCount } = await admin.from('notifications')
-    .select('id', { count: 'exact', head: true })
-    .eq('user_id', auth.userId)
-    .is('read_at', null)
-
-  return ok({ notifications: data ?? [], unread_count: unreadCount ?? 0 })
+  const data = await backendFetch<{ items: any[]; unread: number }>(
+    `/notifications?limit=${limit}&unread=${unreadOnly}`,
+    auth.token,
+  )
+  return ok({ notifications: data.items ?? [], unread_count: data.unread ?? 0 })
 })
 
-// PATCH /api/notifications — segna tutte come lette (o una specifica)
+// PATCH /api/notifications — segna come lette. Contratto storico: `{id}`
+// singola, oppure nessun campo per "segna tutte". Il chiamante reale in
+// lib/client-api.ts (Notifications.markRead) manda però `{ids: string[]}`
+// (array) — un disallineamento pre-esistente per cui quella chiamata finiva
+// sempre nel ramo "segna tutte" invece che sulle sole id passate. Corretto
+// qui supportando anche `ids[]`, chiamando il backend una volta per id
+// (non esiste un endpoint di marcatura bulk lato backend).
 export const PATCH = authHandler(async (req, auth) => {
   const body = await parseBody(req)
-  const admin = getAdmin()
-  const now = new Date().toISOString()
 
   if (body.id) {
-    // Segna una notifica specifica
-    await admin.from('notifications')
-      .update({ read_at: now })
-      .eq('id', body.id as string)
-      .eq('user_id', auth.userId)
+    await backendFetch(`/notifications/${body.id}/read`, auth.token, { method: 'POST' })
+  } else if (Array.isArray(body.ids) && body.ids.length > 0) {
+    for (const id of body.ids as string[]) {
+      await backendFetch(`/notifications/${id}/read`, auth.token, { method: 'POST' })
+    }
   } else {
-    // Segna tutte come lette
-    await admin.from('notifications')
-      .update({ read_at: now })
-      .eq('user_id', auth.userId)
-      .is('read_at', null)
+    await backendFetch('/notifications/read-all', auth.token, { method: 'POST' })
   }
 
   return ok({ message: 'Notifiche aggiornate' })
 })
 
-// DELETE /api/notifications — elimina notifica
+// DELETE /api/notifications — elimina notifica.
 export const DELETE = authHandler(async (req, auth) => {
   const body = await parseBody(req)
   if (!body.id) throw apiError('ID notifica obbligatorio')
 
-  const admin = getAdmin()
-  await admin.from('notifications')
-    .delete()
-    .eq('id', body.id as string)
-    .eq('user_id', auth.userId)
-
+  await backendFetch(`/notifications/${body.id}`, auth.token, { method: 'DELETE' })
   return ok({ message: 'Notifica eliminata' })
 })

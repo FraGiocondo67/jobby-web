@@ -24,6 +24,10 @@ export interface AuthContext {
   userId: string
   role: 'client' | 'provider' | 'both'
   status: string
+  // BLOCCO 7b: token Supabase grezzo, per le route convertite a proxy verso
+  // il backend FastAPI (vedi backendFetch sotto) — stesso identico JWT,
+  // il backend rifà la propria verifica indipendente (deps_pg.get_current_user).
+  token: string
 }
 
 // ── ERROR CLASS ───────────────────────────────────────────────────────────────
@@ -52,7 +56,7 @@ export async function requireAuth(req: NextRequest): Promise<AuthContext> {
   const { data: jobbyUser, error: userErr } = await admin
     .from('users').select('id, role, status').eq('auth_id', user.id).single()
   if (userErr || !jobbyUser) throw apiError('Utente non trovato', 404)
-  return { authId: user.id, userId: jobbyUser.id, role: jobbyUser.role, status: jobbyUser.status }
+  return { authId: user.id, userId: jobbyUser.id, role: jobbyUser.role, status: jobbyUser.status, token }
 }
 
 // ── RESPONSES ─────────────────────────────────────────────────────────────────
@@ -148,4 +152,34 @@ export function parsePagination(searchParams: Record<string, string>) {
 
 export async function sendNotification(userId: string, type: string, title: string, body: string, data: Record<string, unknown> = {}) {
   return notify(userId, type, title, body, data)
+}
+
+// ── BACKEND FASTAPI (BLOCCO 7b) ────────────────────────────────────────────
+// Proxy verso il backend condiviso (Render, stesso usato da app mobile e dal
+// pannello admin) — per le route jobby-web convertite da "scrivi/leggi
+// Supabase direttamente" a "chiama il backend". BACKEND_URL è server-side
+// only (nessun prefisso NEXT_PUBLIC_): queste chiamate partono sempre da un
+// Route Handler Next.js, mai dal browser.
+const BACKEND_URL = (process.env.BACKEND_URL ?? 'https://jobby-backend-a2s1.onrender.com').replace(/\/$/, '')
+
+export async function backendFetch<T = unknown>(
+  path: string,
+  token: string,
+  opts: { method?: string; body?: unknown } = {},
+): Promise<T> {
+  const res = await fetch(`${BACKEND_URL}/api${path}`, {
+    method: opts.method ?? 'GET',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    ...(opts.body !== undefined ? { body: JSON.stringify(opts.body) } : {}),
+  })
+
+  const isJson = res.headers.get('content-type')?.includes('application/json')
+  const payload = isJson ? await res.json().catch(() => null) : null
+
+  if (!res.ok) {
+    const raw = payload?.detail ?? payload?.error ?? payload?.message
+    const message = typeof raw === 'string' ? raw : `Errore ${res.status} dal backend`
+    throw apiError(message, res.status, typeof raw === 'string' ? undefined : JSON.stringify(raw))
+  }
+  return payload as T
 }

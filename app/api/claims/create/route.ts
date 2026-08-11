@@ -1,14 +1,23 @@
 import { NextRequest } from 'next/server'
-import { authHandler, getAdmin, getMission, parseBody, requireField, created, apiError } from '@/lib/api'
+import { authHandler, backendFetch, getMission, parseBody, requireField, created, apiError, ApiError } from '@/lib/api'
 
-// Finestra massima per aprire una segnalazione dopo l'esecuzione del servizio.
-// Deve restare allineata alla stessa soglia usata da create_payout_request (Supabase)
-// per l'esclusione delle missioni con claim/dispute aperti dal calcolo del payout.
-const CLAIM_WINDOW_HOURS = 2
+// Il backend usa codici brevi per `detail` (serve anche mobile/Retool, che
+// localizzano da soli) — jobby-web mostrava invece frasi complete in
+// italiano direttamente all'utente: mappiamo qui i pochi codici noti così
+// non si perde il messaggio leggibile per chi usa già questa route.
+const FRIENDLY_MESSAGES: Record<string, string> = {
+  claim_already_open: 'Hai già una segnalazione aperta per questa missione',
+  mission_not_found: 'Missione non trovata',
+  forbidden: 'Non sei autorizzato a compiere questa azione',
+}
 
 // POST /api/claims/create — il cliente segnala un problema su una propria missione.
-// Backend condiviso: questa route serve sia jobby-web (via lib/client-api.ts) sia
-// jobby-clean (via apiCall assoluto verso lo stesso deploy Netlify).
+// BLOCCO 7b (jobby-web -> client puro): la derivazione della `phase` e la
+// finestra di 2 ore per segnalare un problema post-esecuzione sono state
+// spostate nel backend (POST /claims, routers/disputes.py) così le usano
+// anche mobile/Retool/pannello admin — prima vivevano solo qui. Il backend
+// ignora comunque un eventuale `phase` mandato dal chiamante e la ricalcola
+// sempre da solo, quindi qui non lo mandiamo nemmeno più.
 export const POST = authHandler(async (req, auth) => {
   if (auth.role !== 'client' && auth.role !== 'both')
     throw apiError('Solo i clienti possono aprire una segnalazione', 403)
@@ -16,59 +25,25 @@ export const POST = authHandler(async (req, auth) => {
   const body = await parseBody(req)
   const missionId = requireField<string>(body, 'mission_id')
   const reason = requireField<string>(body, 'reason').trim()
-  const description = (body.description as string | undefined)?.trim() || null
+  const description = (body.description as string | undefined)?.trim() || undefined
 
-  const admin = getAdmin()
+  // Verifica di appartenenza mantenuta qui (lettura, non scrittura) per un
+  // messaggio d'errore immediato lato UI prima di chiamare il backend, che
+  // comunque la riverifica indipendentemente (_load_mission + client_id).
   const mission = await getMission(missionId)
-
   if (mission.client_id !== auth.userId)
     throw apiError('Puoi segnalare un problema solo sulle tue richieste', 403)
 
-  // Determina la fase del claim dallo stato reale della missione (non ci si fida di un
-  // valore inviato dal client) e applica la finestra dei 2h per le missioni concluse.
-  let phase: string
-  if (['published', 'matched', 'confirmed'].includes(mission.status)) {
-    phase = 'pre_execution'
-  } else if (mission.status === 'in_progress') {
-    phase = 'during_execution'
-  } else if (['completed', 'reviewed'].includes(mission.status)) {
-    const executedAt = mission.checkout_at ?? mission.confirmed_at
-    const hoursSince = executedAt ? (Date.now() - new Date(executedAt).getTime()) / 36e5 : Infinity
-    if (hoursSince > CLAIM_WINDOW_HOURS)
-      throw apiError(
-        `Il tempo per segnalare un problema su questa missione è scaduto (max ${CLAIM_WINDOW_HOURS} ore dalla fine del servizio).`,
-        400,
-      )
-    phase = 'post_execution_unpaid'
-  } else {
-    throw apiError('Non puoi segnalare un problema su una missione in questo stato', 400)
-  }
-
-  // Evita segnalazioni duplicate: una sola segnalazione attiva per missione alla volta.
-  const { data: existing } = await admin
-    .from('claims')
-    .select('id')
-    .eq('mission_id', missionId)
-    .in('status', ['open', 'under_review', 'escalated'])
-    .maybeSingle()
-  if (existing) throw apiError('Hai già una segnalazione aperta per questa missione', 409)
-
-  const { data: claim, error } = await admin
-    .from('claims')
-    .insert({ mission_id: missionId, phase, reason, description, status: 'open' })
-    .select('id, mission_id, phase, reason, description, status, created_at')
-    .single()
-
-  if (error) throw apiError('Errore creazione segnalazione', 500, error.message)
-
-  if (mission.provider_id) {
-    await admin.from('notifications').insert({
-      user_id: mission.provider_id,
-      type: 'claim_opened',
-      title: '⚠️ Segnalazione aperta su una missione',
-      body: `Il cliente ha segnalato un problema: ${reason}`,
-      data: { mission_id: missionId, claim_id: claim.id },
+  let claim: any
+  try {
+    claim = await backendFetch<any>('/claims', auth.token, {
+      method: 'POST',
+      body: { mission_id: missionId, reason, description },
     })
+  } catch (err) {
+    if (err instanceof ApiError && FRIENDLY_MESSAGES[err.message])
+      throw apiError(FRIENDLY_MESSAGES[err.message], err.status)
+    throw err
   }
 
   return created({ claim, message: 'Segnalazione inviata. Il nostro team la esaminerà a breve.' })

@@ -1,7 +1,9 @@
 import { NextRequest } from 'next/server'
-import { authHandler, getAdmin, parseBody, ok, apiError } from '@/lib/api'
+import { authHandler, backendFetch, parseBody, ok, apiError } from '@/lib/api'
 
-// PATCH /api/providers/availability — toggle online/offline
+// BLOCCO 7b (jobby-web -> client puro): proxy verso PATCH /provider/availability
+// (routers/provider_onboarding.py) — stesso backend condiviso già usato da
+// app/api/providers/status (le due route erano già praticamente duplicate).
 export const PATCH = authHandler(async (req, auth) => {
   if (auth.role !== 'provider' && auth.role !== 'both')
     throw apiError('Solo i fornitori possono cambiare disponibilità', 403)
@@ -11,10 +13,9 @@ export const PATCH = authHandler(async (req, auth) => {
   if (!['online', 'offline', 'busy'].includes(status))
     throw apiError('Status non valido: online | offline | busy')
 
-  const admin = getAdmin()
-  await admin.from('profiles_provider')
-    .update({ availability_status: status })
-    .eq('user_id', auth.userId)
-
-  return ok({ availability_status: status })
+  const data = await backendFetch<{ availability_status: string }>('/provider/availability', auth.token, {
+    method: 'PATCH',
+    body: { status },
+  })
+  return ok({ availability_status: data.availability_status })
 })

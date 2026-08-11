@@ -1,51 +1,49 @@
 import { NextRequest } from 'next/server'
-import { authHandler, getAdmin, getMission, parseBody, requireField, ok, created, apiError } from '@/lib/api'
+import { authHandler, getMission, backendFetch, parseBody, requireField, ok, created, apiError } from '@/lib/api'
 
-// GET /api/chat/[missionId] — carica messaggi + info conversazione
+// BLOCCO 7b (jobby-web -> client puro): i messaggi (lettura, invio, marcatura
+// come letti) passano ora dal backend condiviso (GET/POST /chat/{mission_id}),
+// stesso usato da app mobile/Retool/pannello admin — prima leggevano/
+// scrivevano `public.messages` direttamente via Supabase.
+//
+// getMission() resta una lettura diretta Supabase, deliberatamente: qui
+// serve solo per arricchire la risposta con titolo/stato/categoria della
+// missione e i dati dell'altro partecipante (nome/telefono) — non è "dato di
+// chat", è metadata di missione già disponibile via join. Convertirla
+// richiederebbe un endpoint backend generico "dettaglio missione" che oggi
+// non esiste per nessuna delle 4 verticali (stesso gap già segnalato nello
+// spec di mappatura per il redesign missioni, Blocco 8) — fuori scope qui.
 export const GET = authHandler(async (req, auth, ctx) => {
-  const mission = await getMission(ctx!.params.missionId, auth.userId)
-  const { searchParams } = new URL(req.url)
-  const limit = Math.min(parseInt(searchParams.get('limit') ?? '100'), 200)
-  const before = searchParams.get('before') // cursore per paginazione
+  const missionId = ctx!.params.missionId
+  const mission = await getMission(missionId, auth.userId)
+  const messages = await backendFetch<any[]>(`/chat/${missionId}`, auth.token)
 
-  const admin = getAdmin()
-  let query = admin.from('messages')
-    .select('id, sender_id, receiver_id, content, created_at, read_at')
-    .eq('mission_id', ctx!.params.missionId)
-    .order('created_at', { ascending: true })
-    .limit(limit)
-
-  if (before) query = query.lt('created_at', before)
-
-  const { data: messages, error } = await query
-  if (error) throw apiError('Errore caricamento messaggi', 500, error.message)
-
-  // Segna come letti i messaggi ricevuti
-  await admin.from('messages')
-    .update({ read_at: new Date().toISOString() })
-    .eq('mission_id', ctx!.params.missionId)
-    .eq('receiver_id', auth.userId)
-    .is('read_at', null)
-
-  // Info sull'altro partecipante
   const otherUserId = auth.userId === mission.client_id ? mission.provider_id : mission.client_id
-  const { data: otherUser } = await admin.from('users')
-    .select('id, full_name').eq('id', otherUserId!).maybeSingle()
+  const otherUser =
+    otherUserId && (mission as any).provider?.id === otherUserId
+      ? (mission as any).provider
+      : otherUserId && (mission as any).client?.id === otherUserId
+        ? (mission as any).client
+        : null
 
   return ok({
     messages: messages ?? [],
     mission: {
       id: mission.id, title: mission.title, status: mission.status,
-      category: mission.category,
+      category: (mission as any).category,
     },
     otherUser,
   })
 })
 
-// POST /api/chat/[missionId] — invia messaggio
 export const POST = authHandler(async (req, auth, ctx) => {
-  const mission = await getMission(ctx!.params.missionId, auth.userId)
+  const missionId = ctx!.params.missionId
+  const mission = await getMission(missionId, auth.userId)
 
+  // Regola UX preesistente non ancora portata nel backend (chat.py non
+  // applica alcuna restrizione di stato, solo che il mittente sia
+  // client/provider della missione) — tenuta qui lato proxy per non perdere
+  // comportamento; da valutare se spostarla server-side in futuro.
   if (!['matched', 'confirmed', 'in_progress', 'completed', 'reviewed'].includes(mission.status))
     throw apiError('Non puoi inviare messaggi per questa missione')
 
@@ -54,18 +52,9 @@ export const POST = authHandler(async (req, auth, ctx) => {
   if (content.length === 0) throw apiError('Il messaggio non può essere vuoto')
   if (content.length > 2000) throw apiError('Messaggio troppo lungo (max 2000 caratteri)')
 
-  const receiverId = auth.userId === mission.client_id ? mission.provider_id : mission.client_id
-  if (!receiverId) throw apiError('Destinatario non trovato')
-
-  const admin = getAdmin()
-  const { data: message, error } = await admin.from('messages').insert({
-    mission_id: ctx!.params.missionId,
-    sender_id: auth.userId,
-    receiver_id: receiverId,
-    content,
-  }).select('id, sender_id, receiver_id, content, created_at, read_at').single()
-
-  if (error) throw apiError('Errore invio messaggio', 500, error.message)
-
+  const message = await backendFetch<any>(`/chat/${missionId}`, auth.token, {
+    method: 'POST',
+    body: { content },
+  })
   return created({ message })
 })
