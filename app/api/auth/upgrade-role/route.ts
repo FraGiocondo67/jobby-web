@@ -3,6 +3,19 @@ import { authHandler, getAdmin, parseBody, ok, apiError } from '@/lib/api'
 
 // POST /api/auth/upgrade-role
 // Permette a un cliente di diventare anche fornitore, o viceversa
+//
+// NOTA (Blocco 7c): richiesto di ritirare questa route insieme a
+// auth/register, ma verificato via grep che è ancora l'unico endpoint dietro
+// il bottone "+ Diventa anche Fornitore/Cliente" di RoleSection.tsx, montato
+// in tre pagine profilo live (app/(client)/client/profile,
+// app/(provider)/provider/profile, app/(business)/business/profile).
+// Ritirarla come auth/register avrebbe rotto quella funzionalità in
+// produzione senza un sostituto pronto. Lasciata attiva così com'è (usa
+// Admin API server-side, non tocca Supabase Auth quindi non ha lo stesso
+// problema di auth/register che duplicava la creazione account bypassando il
+// flusso reale). Candidata naturale per un futuro endpoint backend condiviso
+// (PATCH /profile già esiste per altri campi, ma non gestisce ancora il
+// cambio ruolo) — da valutare quando si torna sul resto del Blocco 7.
 export const POST = authHandler(async (req, auth) => {
   const body = await parseBody(req)
   const targetRole = body.role as string // 'both'
