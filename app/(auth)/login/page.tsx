@@ -3,6 +3,7 @@ import { useState } from 'react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { supabase } from '@/lib/supabase'
+import { completeOnboardingFromMetadata } from '@/lib/onboarding'
 import { useLanguage } from '@/lib/i18n'
 
 export default function LoginPage() {
@@ -20,15 +21,21 @@ export default function LoginPage() {
       const { data, error: authError } = await supabase.auth.signInWithPassword({ email, password })
       if (authError) { setError(authError.message); return }
 
+      // BLOCCO 7c: se questo è il primo login dopo una registrazione fatta
+      // con conferma email attiva, i dati di onboarding erano ancora "in
+      // sospeso" in user_metadata (non c'era una sessione per completarli
+      // subito in fase di signup) — li applichiamo ora. Su un login normale
+      // (nessun onboarding pendente) questa chiamata è un no-op veloce.
+      const pending = await completeOnboardingFromMetadata()
+
       const { data: user } = await supabase
         .from('users')
         .select('role, is_proximity_business:profiles_provider(is_proximity_business)')
         .eq('auth_id', data.user.id)
         .single()
 
-      if (user?.role === 'client') router.push('/client')
-      else if (user?.role === 'provider') router.push('/provider')
-      else if (user?.role === 'both') router.push('/client')
+      const role = pending?.role ?? user?.role
+      if (role === 'provider') router.push('/provider')
       else router.push('/client')
     } catch {
       setError(t('connectionError'))

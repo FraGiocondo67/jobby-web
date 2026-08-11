@@ -3,6 +3,7 @@ import { useState, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { supabase } from '@/lib/supabase'
+import { completeOnboardingFromMetadata, type OnboardingMeta } from '@/lib/onboarding'
 import { useLanguage } from '@/lib/i18n'
 
 // Fallback statico usato solo se il fetch dinamico da service_categories fallisce
@@ -73,28 +74,43 @@ export default function RegisterPage() {
 
     setLoading(true); setError('')
     try {
-      const businessData = isProximity ? {
-        vat_number: vatNumber.trim(),
-        business_name: businessName.trim() || fullName.trim(),
-        business_address: businessAddress.trim(),
-        can_travel: canTravel,
-        travel_radius_km: parseInt(travelRadius) || 5,
-        products: products.split('\n').map(p => p.trim()).filter(Boolean),
-        proximity_category: proximityCategory,
-      } : null
+      // BLOCCO 7c (jobby-web -> client puro): signup client-side via Supabase
+      // (come l'app mobile), non più l'Admin API del backend legacy Netlify.
+      // I dati di onboarding (ruolo, profilo business/prossimità) vengono
+      // salvati in user_metadata e applicati da completeOnboardingFromMetadata()
+      // al primo login riuscito — vedi lib/onboarding.ts per il perché.
+      const onboarding: OnboardingMeta = {
+        role,
+        name: fullName.trim(),
+        phone: phone.trim() || undefined,
+        address: isProximity ? businessAddress.trim() : undefined,
+        radius_km: isProximity ? (parseInt(travelRadius) || 5) : undefined,
+        services: isProximity && proximityCategory ? [proximityCategory] : undefined,
+        business_name: isProximity ? (businessName.trim() || fullName.trim()) : undefined,
+        vat_number: isProximity ? vatNumber.trim() : undefined,
+        service_mode: isProximity ? (canTravel ? 'both' : 'in_shop') : undefined,
+        products: isProximity ? products.split('\n').map(p => p.trim()).filter(Boolean) : undefined,
+      }
 
-      const res = await fetch('https://jobby-platform-app.netlify.app/api/auth/register', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email, password, full_name: fullName, phone, role,
-          preferred_lang: 'it',
-          is_proximity_business: isProximity,
-          business_data: businessData,
-        }),
+      const { data, error: signUpError } = await supabase.auth.signUp({
+        email, password,
+        options: { data: { full_name: fullName.trim(), onboarding } },
       })
-      const data = await res.json()
-      if (!res.ok) { setError(data.error || t('errorRegistrationGeneric')); return }
+      if (signUpError) {
+        const msg = signUpError.message.toLowerCase()
+        setError(msg.includes('already registered') || msg.includes('already exists')
+          ? t('errorRegistrationGeneric') : signUpError.message)
+        return
+      }
+
+      if (data.session) {
+        // Rarissimo con conferma email attiva, ma se capita completiamo
+        // subito invece di aspettare un login che non serve.
+        const result = await completeOnboardingFromMetadata()
+        router.push(result?.role === 'provider' ? '/provider' : '/client')
+        return
+      }
+
       router.push('/login?registered=1')
     } catch { setError(t('connectionError')) }
     finally { setLoading(false) }
